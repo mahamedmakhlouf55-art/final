@@ -1,0 +1,142 @@
+name: Build CelYah APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'lib/**'
+      - 'assets/**'
+      - 'pubspec.yaml'
+      - 'pubspec.lock'
+      - '.github/workflows/build_apk.yml'
+
+jobs:
+  build:
+    name: Build Android Release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Check Flutter environment
+        run: flutter --version
+
+      - name: Generate Android project
+        run: |
+          flutter create --platforms=android --project-name celyah .
+
+      - name: Pin BLE plugin to SDK 36 compatible release
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+          p = Path('pubspec.yaml')
+          s = p.read_text()
+          s, n = re.subn(r'(?m)^(\s*flutter_reactive_ble:)\s*[^\n#]+', r'\g<1> 5.4.2', s, count=1)
+          if n != 1:
+              raise SystemExit('flutter_reactive_ble dependency missing in pubspec.yaml')
+          if 'dependency_overrides:' not in s:
+              s += '\ndependency_overrides:\n  reactive_ble_mobile: 5.4.2\n'
+          else:
+              s = re.sub(r'(?m)^(dependency_overrides:\s*\n)', r'\g<1>  reactive_ble_mobile: 5.4.2\n', s, count=1)
+          p.write_text(s)
+          print('Pinned flutter_reactive_ble and reactive_ble_mobile to 5.4.2')
+          PYCODE
+          rm -f pubspec.lock
+
+      - name: Fix Android launch background
+        run: |
+          mkdir -p android/app/src/main/res/drawable-v21
+          cat > android/app/src/main/res/drawable-v21/launch_background.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+              <item>
+                  <shape android:shape="rectangle">
+                      <solid android:color="#0B0915" />
+                  </shape>
+              </item>
+          </layer-list>
+          XML
+          mkdir -p android/app/src/main/res/drawable
+          cp android/app/src/main/res/drawable-v21/launch_background.xml android/app/src/main/res/drawable/launch_background.xml
+
+      - name: Install Flutter packages
+        run: flutter pub get
+
+      - name: Fix BLE plugin Android compile SDK
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+          cache = Path.home() / '.pub-cache' / 'hosted' / 'pub.dev'
+          candidates = list(cache.glob('reactive_ble_mobile-*/android/build.gradle')) + list(cache.glob('reactive_ble_mobile-*/android/build.gradle.kts'))
+          if not candidates:
+              raise SystemExit('Could not find reactive_ble_mobile Android Gradle file after flutter pub get')
+          for path in candidates:
+              original = path.read_text()
+              if path.suffix == '.kts':
+                  pattern = r'(?m)^(\s*compileSdk\s*=\s*)(?:\d+|flutter\.compileSdkVersion)'
+                  replacement = r'\g<1>36'
+              else:
+                  pattern = r'(?m)^(\s*compileSdk(?:Version)?\s*(?:=\s*)?)(?:\d+|flutter\.compileSdkVersion)'
+                  replacement = r'\g<1>36'
+              updated, count = re.subn(pattern, replacement, original)
+              if count == 0:
+                  raise SystemExit(f'Could not locate compileSdk in {path}; inspect plugin Gradle syntax')
+              path.write_text(updated)
+              print(f'Patched {path} ({count} occurrences): compileSdk 36')
+          app = Path('android/app/build.gradle.kts')
+          if app.exists():
+              src = app.read_text()
+              src, count = re.subn(r'(?m)^(\s*compileSdk\s*=\s*)(?:\d+|flutter\.compileSdkVersion)', r'\g<1>36', src)
+              if count == 0:
+                  raise SystemExit('Could not locate app compileSdk')
+              app.write_text(src)
+          else:
+              app = Path('android/app/build.gradle')
+              src = app.read_text()
+              src, count = re.subn(r'(?m)^(\s*compileSdk(?:Version)?\s*(?:=\s*)?)(?:\d+|flutter\.compileSdkVersion)', r'\g<1>36', src)
+              if count == 0:
+                  raise SystemExit('Could not locate app compileSdk')
+              app.write_text(src)
+          print('Android app and BLE plugin compileSdk aligned to 36')
+          PYCODE
+
+      - name: Add Android Bluetooth microphone and network permissions
+        run: |
+          sed -i "s|app_build/android/app/src/main/AndroidManifest.xml|android/app/src/main/AndroidManifest.xml|" tools/patch_manifest.py
+          python3 tools/patch_manifest.py
+
+      - name: Accept Android SDK licenses
+        run: yes | flutter doctor --android-licenses || true
+
+      - name: Build release APK
+        run: flutter build apk --release --no-tree-shake-icons
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CelYah-Robot-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
